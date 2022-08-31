@@ -26,7 +26,7 @@ from utils.datasets import create_dataloader
 from utils.general import (
     torch_distributed_zero_first, labels_to_class_weights, plot_labels, check_anchors, labels_to_image_weights,
     compute_loss, plot_images, fitness, strip_optimizer, plot_results, get_latest_run, check_dataset, check_file,
-    check_git_status, check_img_size, increment_dir, print_mutation, plot_evolution, set_logging)
+    check_git_status, check_img_size, increment_dir, print_mutation, plot_evolution, set_logging, compute_custom_loss)
 from utils.google_utils import attempt_download
 from utils.torch_utils import init_seeds, ModelEMA, select_device, intersect_dicts
 
@@ -59,6 +59,8 @@ def train(hyp, opt, device, tb_writer=None):
         check_dataset(data_dict)  # check
     train_path = data_dict['train']
     test_path = data_dict['val']
+    train_csv = data_dict['train_csv']
+    test_csv = data_dict['val_csv']
     nc, names = (1, ['item']) if opt.single_cls else (int(data_dict['nc']), data_dict['names'])  # number classes, names
     assert len(names) == nc, '%g names found for nc=%g dataset in %s' % (len(names), nc, opt.data)  # check
 
@@ -80,14 +82,27 @@ def train(hyp, opt, device, tb_writer=None):
         model = Model(opt.cfg, ch=3, nc=nc).to(device)  # create
 
     # Freeze
+    # TODO: https://github.com/ultralytics/yolov5/issues/679 --> for transfer learning
     freeze = ['', ]  # parameter names to freeze (full or partial)
-    if any(freeze):
-        for k, v in model.named_parameters():
-            if any(x in k for x in freeze):
-                print('freezing %s' % k)
-                v.requires_grad = False
+    # if any(freeze):
+    #     for k, v in model.named_parameters():
+    #         if any(x in k for x in freeze):
+    #             print('freezing %s' % k)
+    #             v.requires_grad = False
+    # Freeze
+    # TODO: choose non-empty list for transfer learning
+    # freeze = []  # parameter names to freeze (full or partial)
+    freeze = ['model.{x}.'.format(x=x) for x in range(10)]
+    # TODO: freeze until 9 for backbone
+    # TODO: freeze until 23 for backbone + neck (NOT SURE)
+    #print(model.info(verbose=True))
+    for k, v in model.named_parameters():
+        v.requires_grad = True  # train all layers
+        if any(x in k for x in freeze):
+            print('freezing %s' % k)
+            v.requires_grad = False
 
-    # Optimizer
+            # Optimizer
     nbs = 64  # nominal batch size
     accumulate = max(round(nbs / total_batch_size), 1)  # accumulate loss before optimizing
     hyp['weight_decay'] *= total_batch_size * accumulate / nbs  # scale weight_decay
@@ -164,8 +179,11 @@ def train(hyp, opt, device, tb_writer=None):
         model = DDP(model, device_ids=[opt.local_rank], output_device=opt.local_rank)
 
     # Trainloader
-    dataloader, dataset = create_dataloader(train_path, imgsz, batch_size, gs, opt,
-                                            hyp=hyp, augment=True, cache=opt.cache_images, rect=opt.rect,
+    #dataloader, dataset = create_dataloader(train_path, imgsz, batch_size, gs, opt,
+    #                                        hyp=hyp, augment=True, cache=opt.cache_images, rect=opt.rect,
+    #                                        rank=rank, world_size=opt.world_size, workers=opt.workers)
+    dataloader, dataset = create_dataloader(train_csv, train_path, imgsz, batch_size, gs, opt,  # augment = False, train_csv added
+                                            hyp=hyp, augment=False, cache=opt.cache_images, rect=opt.rect,
                                             rank=rank, world_size=opt.world_size, workers=opt.workers)
     mlc = np.concatenate(dataset.labels, 0)[:, 0].max()  # max label class
     nb = len(dataloader)  # number of batches
@@ -174,7 +192,7 @@ def train(hyp, opt, device, tb_writer=None):
     # Process 0
     if rank in [-1, 0]:
         ema.updates = start_epoch * nb // accumulate  # set EMA updates
-        testloader = create_dataloader(test_path, imgsz_test, total_batch_size, gs, opt,
+        testloader = create_dataloader(test_csv, test_path, imgsz_test, total_batch_size, gs, opt, ## test_csv added
                                        hyp=hyp, augment=False, cache=opt.cache_images and not opt.notest, rect=True,
                                        rank=-1, world_size=opt.world_size, workers=opt.workers)[0]  # testloader
 
@@ -231,7 +249,8 @@ def train(hyp, opt, device, tb_writer=None):
         # b = int(random.uniform(0.25 * imgsz, 0.75 * imgsz + gs) // gs * gs)
         # dataset.mosaic_border = [b - imgsz, -b]  # height, width borders
 
-        mloss = torch.zeros(4, device=device)  # mean losses
+        #mloss = torch.zeros(4, device=device)  # mean losses
+        mloss = torch.zeros(4, device=device)  # custom mean losses
         if rank != -1:
             dataloader.sampler.set_epoch(epoch)
         pbar = enumerate(dataloader)
@@ -264,8 +283,11 @@ def train(hyp, opt, device, tb_writer=None):
 
             # Forward
             with amp.autocast(enabled=cuda):
+                # reshapeing images so they are compatible with model
+                imgs = imgs.reshape(imgs.shape[0], 1, imgs.shape[1], imgs.shape[2]) ####
                 pred = model(imgs)  # forward
-                loss, loss_items = compute_loss(pred, targets.to(device), model)  # loss scaled by batch_size
+                #loss, loss_items = compute_loss(pred, targets.to(device), model)  # loss scaled by batch_size
+                loss, loss_items = compute_custom_loss(pred, targets.to(device), model)  # custom loss for dental surgery
                 if rank != -1:
                     loss *= opt.world_size  # gradient averaged between devices in DDP mode
 
@@ -284,8 +306,10 @@ def train(hyp, opt, device, tb_writer=None):
             if rank in [-1, 0]:
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
                 mem = '%.3gG' % (torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0)  # (GB)
+                #s = ('%10s' * 2 + '%10.4g' * 6) % (
+                #    '%g/%g' % (epoch, epochs - 1), mem, *mloss, targets.shape[0], imgs.shape[-1])
                 s = ('%10s' * 2 + '%10.4g' * 6) % (
-                    '%g/%g' % (epoch, epochs - 1), mem, *mloss, targets.shape[0], imgs.shape[-1])
+                    '%g/%g' % (epoch, epochs - 1), mem, *mloss, targets.shape[0], imgs.shape[-1]) # custom s for 3 mloss arguments
                 pbar.set_description(s)
 
                 # Plot
@@ -378,6 +402,7 @@ def train(hyp, opt, device, tb_writer=None):
 
 
 if __name__ == '__main__':
+    # TODO: change inputs to a single config file
     parser = argparse.ArgumentParser()
     parser.add_argument('--weights', type=str, default='yolov5s.pt', help='initial weights path')
     parser.add_argument('--cfg', type=str, default='', help='model.yaml path')

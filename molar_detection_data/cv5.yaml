@@ -1,0 +1,8 @@
+train: ../data/annotated/patches/images_nmasks
+val: ../data/annotated/patches/images_nmasks
+
+train_csv: ../data/annotated/annotations/yolo_annotations/cv5/train_annotations.csv
+val_csv: ../data/annotated/annotations/yolo_annotations/cv5/valid_annotations.csv
+
+nc: 1
+names: ['Molar']

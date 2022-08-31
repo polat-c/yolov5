@@ -1,5 +1,5 @@
 # parameters
-nc: 80  # number of classes
+nc: 1  # number of classes (changed from 80 to 1 for molar detection problem)
 depth_multiple: 0.67  # model depth multiple
 width_multiple: 0.75  # layer channel multiple
 

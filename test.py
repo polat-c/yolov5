@@ -94,8 +94,10 @@ def test(data,
         img = img.half() if half else img.float()  # uint8 to fp16/32
         img /= 255.0  # 0 - 255 to 0.0 - 1.0
         targets = targets.to(device)
-        nb, _, height, width = img.shape  # batch size, channels, height, width
+        #nb, _, height, width = img.shape  # batch size, channels, height, width
+        nb, height, width = img.shape  # batch size, height, width
         whwh = torch.Tensor([width, height, width, height]).to(device)
+        img = img.reshape(img.shape[0], 1, img.shape[1], img.shape[2]) # reshaping, so it's compatible
 
         # Disable gradients
         with torch.no_grad():

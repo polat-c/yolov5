@@ -6,6 +6,8 @@ import shutil
 import time
 from pathlib import Path
 from threading import Thread
+import pandas as pd
+import torchvision.transforms.functional as F
 
 import cv2
 import numpy as np
@@ -13,11 +15,13 @@ import torch
 from PIL import Image, ExifTags
 from torch.utils.data import Dataset
 from tqdm import tqdm
+import SimpleITK as sitk
 
 from utils.general import xyxy2xywh, xywh2xyxy, torch_distributed_zero_first
 
 help_url = 'https://github.com/ultralytics/yolov5/wiki/Train-Custom-Data'
-img_formats = ['.bmp', '.jpg', '.jpeg', '.png', '.tif', '.tiff', '.dng']
+#img_formats = ['.bmp', '.jpg', '.jpeg', '.png', '.tif', '.tiff', '.dng']
+img_formats = ['.bmp', '.jpg', '.jpeg', '.png', '.tif', '.tiff', '.dng', '.dcm'] # added new xray image format
 vid_formats = ['.mov', '.avi', '.mp4', '.mpg', '.mpeg', '.m4v', '.wmv', '.mkv']
 
 # Get orientation exif tag
@@ -46,11 +50,11 @@ def exif_size(img):
     return s
 
 
-def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=False, cache=False, pad=0.0, rect=False,
-                      rank=-1, world_size=1, workers=8):
+def create_dataloader(csv_file, path, imgsz, batch_size, stride, opt, hyp=None, augment=False, cache=False, pad=0.0, rect=False,
+                      rank=-1, world_size=1, workers=8): ## csv_file added
     # Make sure only the first process in DDP process the dataset first, and the following others can use the cache.
     with torch_distributed_zero_first(rank):
-        dataset = LoadImagesAndLabels(path, imgsz, batch_size,
+        dataset = LoadImagesAndLabels(csv_file, path, imgsz, batch_size, ## csv_file added
                                       augment=augment,  # augment images
                                       hyp=hyp,  # augmentation hyperparameters
                                       rect=rect,  # rectangular training
@@ -107,17 +111,26 @@ class _RepeatSampler(object):
 
 
 class LoadImages:  # for inference
-    def __init__(self, path, img_size=640):
-        p = str(Path(path))  # os-agnostic
-        p = os.path.abspath(p)  # absolute path
-        if '*' in p:
-            files = sorted(glob.glob(p, recursive=True))  # glob
-        elif os.path.isdir(p):
-            files = sorted(glob.glob(os.path.join(p, '*.*')))  # dir
-        elif os.path.isfile(p):
-            files = [p]  # files
-        else:
-            raise Exception('ERROR: %s does not exist' % p)
+    def __init__(self, csv_file, path, img_size=640):
+        #p = str(Path(path))  # os-agnostic
+        #p = os.path.abspath(p)  # absolute path
+        #if '*' in p:
+        #    files = sorted(glob.glob(p, recursive=True))  # glob
+        #elif os.path.isdir(p):
+        #    files = sorted(glob.glob(os.path.join(p, '*.*')))  # dir
+        #elif os.path.isfile(p):
+        #    files = [p]  # files
+        #else:
+        #    raise Exception('ERROR: %s does not exist' % p)
+
+        self.annotations = pd.read_csv(csv_file)
+        try:
+            files = [] # image files
+            for name in self.annotations['File_name']:
+                img_file = path + '/' + name + '.dcm'
+                files.append(img_file)
+        except Exception as e:
+            raise Exception('Error loading data from %s: %s\nSee %s' % (path, e, help_url))
 
         images = [x for x in files if os.path.splitext(x)[-1].lower() in img_formats]
         videos = [x for x in files if os.path.splitext(x)[-1].lower() in vid_formats]
@@ -164,7 +177,13 @@ class LoadImages:  # for inference
         else:
             # Read image
             self.count += 1
-            img0 = cv2.imread(path)  # BGR
+            #img0 = cv2.imread(path)  # BGR
+            img0 = sitk.GetArrayFromImage(sitk.ReadImage(path))   # for dental images
+            img0 = img0.reshape(img0.shape[1], img0.shape[2], 1)  #
+            # img0 = img0.astype(np.int64)
+            # std = 17384.53
+            # mean = 30072.829025877254
+            # img0 = (img0 - mean) / std
             assert img0 is not None, 'Image Not Found ' + path
             print('image %g/%g %s: ' % (self.count, self.nf, path), end='')
 
@@ -172,8 +191,13 @@ class LoadImages:  # for inference
         img = letterbox(img0, new_shape=self.img_size)[0]
 
         # Convert
-        img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
+        #img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
+        img = img.reshape(1, img.shape[0], img.shape[1])
         img = np.ascontiguousarray(img)
+        img = img.astype(np.int16)
+
+        print(img.shape)
+        print(img0.shape)
 
         # cv2.imwrite(path + '.letterbox.jpg', 255 * img.transpose((1, 2, 0))[:, :, ::-1])  # save letterbox image
         return path, img, img0, self.cap
@@ -326,8 +350,20 @@ class LoadStreams:  # multiple IP or RTSP cameras
 
 
 class LoadImagesAndLabels(Dataset):  # for training/testing
-    def __init__(self, path, img_size=640, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False,
+    def __init__(self, csv_file, path, img_size=640, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False,
                  cache_images=False, single_cls=False, stride=32, pad=0.0, rank=-1):
+
+        self.annotations = pd.read_csv(csv_file)
+        try:
+            f = [] # image files
+            for name in self.annotations['File_name']:
+                img_file = path + '/' + name + '.dcm'
+                f.append(img_file)
+            self.img_files = f
+        except Exception as e:
+            raise Exception('Error loading data from %s: %s\nSee %s' % (path, e, help_url))
+
+        '''
         try:
             f = []  # image files
             for p in path if isinstance(path, list) else [path]:
@@ -345,6 +381,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 [x.replace('/', os.sep) for x in f if os.path.splitext(x)[-1].lower() in img_formats])
         except Exception as e:
             raise Exception('Error loading data from %s: %s\nSee %s' % (path, e, help_url))
+        '''
 
         n = len(self.img_files)
         assert n > 0, 'No images found in %s. See %s' % (path, help_url)
@@ -363,8 +400,10 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         self.stride = stride
 
         # Define labels
-        sa, sb = os.sep + 'images' + os.sep, os.sep + 'labels' + os.sep  # /images/, /labels/ substrings
-        self.label_files = [x.replace(sa, sb, 1).replace(os.path.splitext(x)[-1], '.txt') for x in self.img_files]
+        #sa, sb = os.sep + 'images' + os.sep, os.sep + 'labels' + os.sep  # /images/, /labels/ substrings
+        sa, sb = os.sep + 'images_nmasks' + os.sep, os.sep + 'labels' + os.sep  # /images/, /labels/ substrings
+        #self.label_files = [x.replace(sa, sb, 1).replace(os.path.splitext(x)[-1], '.txt') for x in self.img_files]
+        self.label_files = [x.replace(sa, sb, 1)[:-4]+'.txt' for x in self.img_files] # custom hard-coded label_files
 
         # Check cache
         cache_path = str(Path(self.label_files[0]).parent) + '.cache'  # cached labels
@@ -438,7 +477,9 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 # Extract object detection boxes for a second stage classifier
                 if extract_bounding_boxes:
                     p = Path(self.img_files[i])
-                    img = cv2.imread(str(p))
+                    #img = cv2.imread(str(p))
+                    img = sitk.GetArrayFromImage(sitk.ReadImage(str(p)))  # for dental images
+                    img = img.reshape(img.shape[1], img.shape[2], 1)  #
                     h, w = img.shape[:2]
                     for j, x in enumerate(l):
                         f = '%s%sclassifier%s%g_%g_%s' % (p.parent.parent, os.sep, os.sep, x[0], j, p.name)
@@ -452,7 +493,11 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
 
                         b[[0, 2]] = np.clip(b[[0, 2]], 0, w)  # clip boxes outside of image
                         b[[1, 3]] = np.clip(b[[1, 3]], 0, h)
-                        assert cv2.imwrite(f, img[b[1]:b[3], b[0]:b[2]]), 'Failure extracting classifier boxes'
+                        #assert cv2.imwrite(f, img[b[1]:b[3], b[0]:b[2]]), 'Failure extracting classifier boxes'
+                        img = img[b[1]:b[3], b[0]:b[2]]
+                        img = img.reshape(1, img.shape[0], img.shape[1])    # new save option for xray images
+                        img = sitk.GetImageFromArray(img)                   #
+                        assert sitk.WriteImage(img, f), 'Failure extracting classifier boxes'
             else:
                 ne += 1  # print('empty labels for image %s' % self.img_files[i])  # file empty
                 # os.system("rm '%s' '%s'" % (self.img_files[i], self.label_files[i]))  # remove
@@ -483,11 +528,15 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         for (img, label) in pbar:
             try:
                 l = []
-                image = Image.open(img)
-                image.verify()  # PIL verify
-                # _ = io.imread(img)  # skimage verify (from skimage import io)
-                shape = exif_size(image)  # image size
-                assert (shape[0] > 9) & (shape[1] > 9), 'image size <10 pixels'
+                #### these lines check if a legit image, ne need for them in our case
+                #image = Image.open(img)
+                #image.verify()  # PIL verify
+                ## _ = io.imread(img)  # skimage verify (from skimage import io)
+                #shape = exif_size(image)  # image size
+                #assert (shape[0] > 9) & (shape[1] > 9), 'image size <10 pixels'
+                image = sitk.GetArrayFromImage(sitk.ReadImage(img))  # for dental images
+                image = image.reshape(image.shape[1], image.shape[2])    #
+                shape = image.shape
                 if os.path.isfile(label):
                     with open(label, 'r') as f:
                         l = np.array([x.split() for x in f.read().splitlines()], dtype=np.float32)  # labels
@@ -560,7 +609,9 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                                                  perspective=hyp['perspective'])
 
             # Augment colorspace
-            augment_hsv(img, hgain=hyp['hsv_h'], sgain=hyp['hsv_s'], vgain=hyp['hsv_v'])
+
+            # comment out next line, color augmentation
+            #augment_hsv(img, hgain=hyp['hsv_h'], sgain=hyp['hsv_s'], vgain=hyp['hsv_v'])
 
             # Apply cutouts
             # if random.random() < 0.9:
@@ -590,8 +641,10 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             labels_out[:, 1:] = torch.from_numpy(labels)
 
         # Convert
-        img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
+        # comment out next line for color related transform
+        #img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
         img = np.ascontiguousarray(img)
+        img = img.astype(np.int16)
 
         return torch.from_numpy(img), labels_out, self.img_files[index], shapes
 
@@ -609,13 +662,22 @@ def load_image(self, index):
     img = self.imgs[index]
     if img is None:  # not cached
         path = self.img_files[index]
-        img = cv2.imread(path)  # BGR
+        #img = cv2.imread(path)  # BGR
+        img = sitk.GetArrayFromImage(sitk.ReadImage(path))  # for dental images
+        img = img.reshape(img.shape[1], img.shape[2], 1)    #
+        # img = img.astype(np.int64)
+        # std = 17384.53
+        # mean = 30072.829025877254
+        # img = (img - mean) / std
+
         assert img is not None, 'Image Not Found ' + path
         h0, w0 = img.shape[:2]  # orig hw
         r = self.img_size / max(h0, w0)  # resize image to img_size
         if r != 1:  # always resize down, only resize up if training with augmentation
             interp = cv2.INTER_AREA if r < 1 and not self.augment else cv2.INTER_LINEAR
-            img = cv2.resize(img, (int(w0 * r), int(h0 * r)), interpolation=interp)
+            #img = cv2.resize(img, (int(w0 * r), int(h0 * r)), interpolation=interp)
+            img = cv2.resize(img, (int(w0 * r), int(h0 * r)), interpolation=interp) # keeping dimensions, adding ch=1
+            img = img.reshape(img.shape[0], img.shape[1], 1)                        #
         return img, (h0, w0), img.shape[:2]  # img, hw_original, hw_resized
     else:
         return self.imgs[index], self.img_hw0[index], self.img_hw[index]  # img, hw_original, hw_resized
@@ -895,13 +957,18 @@ def reduce_img_size(path='path/images', img_size=1024):  # from utils.datasets i
     create_folder(path_new)
     for f in tqdm(glob.glob('%s/*.*' % path)):
         try:
-            img = cv2.imread(f)
+            #img = cv2.imread(f)
+            img = sitk.GetArrayFromImage(sitk.ReadImage(f))   # for dental images
+            img = img.reshape(img.shape[1], img.shape[2], 1)  #
             h, w = img.shape[:2]
             r = img_size / max(h, w)  # size ratio
             if r < 1.0:
                 img = cv2.resize(img, (int(w * r), int(h * r)), interpolation=cv2.INTER_AREA)  # _LINEAR fastest
             fnew = f.replace(path, path_new)  # .replace(Path(f).suffix, '.jpg')
-            cv2.imwrite(fnew, img)
+            #cv2.imwrite(fnew, img)
+            img = img.reshape(1, img.shape[0], img.shape[1])  # new save option for xray images
+            img = sitk.GetImageFromArray(img)                 #
+            sitk.WriteImage(img, fnew)                        #
         except:
             print('WARNING: image failure %s' % f)
 
@@ -922,6 +989,10 @@ def recursive_dataset2bmp(dataset='path/dataset_bmp'):  # from utils.datasets im
                     f.write(lines)
             elif s in formats:  # replace image
                 cv2.imwrite(p.replace(s, '.bmp'), cv2.imread(p))
+                ##### important also change here
+                newImage = sitk.GetArrayFromImage(sitk.ReadImage(p))                # for dental images
+                newImage = sitk.GetImageFromArray(newImage)                         #
+                sitk.WriteImage(newImage, p.replace(s, '.bmp'))                     #
                 if s != '.bmp':
                     os.system("rm '%s'" % p)
 
